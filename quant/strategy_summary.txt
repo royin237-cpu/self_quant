@@ -1,0 +1,54 @@
+Strategy Summary: Small Cap Low Price Weekly Rotation with IPO Filter and Performance Metrics
+
+Key Features:
+1. Stock Selection:
+   - Universe: Shanghai and Shenzhen main board stocks (codes starting with sh.60 or sz.00)
+   - Weekly rebalancing: every Wednesday (last trading day of the week)
+   - IPO filter: Only stocks listed for more than 1 year (using column 30 as IPO date)
+   - Fundamental filters:
+        * Non-stock status (tradestatus == 1)
+        * Non-ST stocks (isST == 0)
+        * Positive peTTM and pbMRQ
+   - Selection logic:
+        * From valid pool, take the 50 smallest by market value (流通市值)
+        * From these 50, select the 10 lowest priced stocks (close price)
+
+2. Trading Rules:
+   - Buy at closing price (no slippage assumed in this version)
+   - Sell at closing price (no slippage assumed in this version)
+   - Transaction fees:
+        * Commission: max(5 CNY, 0.025% of transaction value)
+        * Transfer fee: 0.001% of transaction value
+        * Stamp duty: 0.05% of transaction value (only on sell)
+   - Position limits: Maximum 10 stocks
+   - Handling of special cases:
+        * Delisted stocks: Position value marked to zero (full loss)
+        * Suspended stocks: Position held, no trade executed
+        * Limit up/down: No trade executed, position held
+
+3. Performance Metrics Calculated:
+   - Total return
+   - Annualized return
+   - Maximum drawdown (percentage)
+   - Maximum drawdown duration (in days)
+   - Sharpe ratio (using 3% annual risk-free rate)
+   - Annual returns breakdown
+
+4. Outputs:
+   - Excel file with detailed trade log: 小市值低价轮动策略明细_每周_含持仓10只_清退市_增强版.xlsx
+   - Plots:
+        * Equity curve (strategy total assets over time)
+        * Drawdown chart (showing underwater periods)
+
+5. Implementation Details:
+   - IPO date column identified as column 30 (original name: 'ʵ����¶��')
+   - Validated that IPO dates typically precede trading start by 0-60 days
+   - Backtest period: From first available date to last available date in the data
+   - Initial capital: 50,000 CNY
+
+Files:
+- Strategy notebook: 小市值_周调仓_清理退市_增强版.ipynb
+- Trade log Excel: 小市值低价轮动策略明细_每周_含持仓10只_清退市_增强版.xlsx (generated upon execution)
+
+Note: To execute the strategy, run the notebook in Jupyter or convert and execute with nbconvert.
+The backtest may take several minutes to complete depending on the data size.

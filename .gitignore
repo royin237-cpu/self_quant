@@ -1,0 +1,30 @@
+# 数据文件（大量 CSV/parquet，不适合放入 git）
+data/data/
+data/data_test/
+
+# Python 缓存
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+
+# IDE
+.idea/
+.vscode/
+.claude/
+
+# WorkBuddy
+.workbuddy/
+
+# 临时文件
+*.tmp
+*.log
+*.bak
+
+# Jupyter checkpoint
+.ipynb_checkpoints/
+
+# 系统文件
+Thumbs.db
+.DS_Store

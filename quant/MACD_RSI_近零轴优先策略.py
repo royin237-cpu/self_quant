@@ -1,0 +1,241 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import os
+
+# 设置绘图支持中文
+plt.rcParams['font.sans-serif'] = ['SimHei']
+plt.rcParams['axes.unicode_minus'] = False
+
+# ==========================================
+# 第一步：配置参数与读取数据
+# ==========================================
+FILE_PATH = r"F:\self_quant\data\data\all_stocks_merged_fixed.parquet"
+OUTPUT_EXCEL = r"F:\self_quant\quant\回测excel\MACD_RSI_近零轴优先策略.xlsx"
+
+INITIAL_CASH = 50000.0  # 初始本金 5万元
+TARGET_STOCK_NUM = 10   # 目标持仓 10 只
+
+print("正在读取全市场数据，请稍候...")
+df = pd.read_parquet(FILE_PATH)
+df['date'] = pd.to_datetime(df['date'])
+
+# 过滤沪深主板股票
+print("正在过滤沪深主板数据...")
+main_board_mask = df['code'].str.contains(r'^sh\.60|^sz\.00', regex=True)
+df = df[main_board_mask].copy()
+
+df.sort_values(by=['code', 'date'], inplace=True)
+
+# ==========================================
+# 第二步：计算技术指标和买入信号
+# ==========================================
+def calculate_rsi(series, period=6):
+    delta = series.diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+    rs = gain / loss
+    return 100 - (100 / (1 + rs))
+
+def calculate_macd(series, short_period=6, long_period=13, signal_period=5):
+    exp1 = series.ewm(span=short_period, adjust=False).mean()
+    exp2 = series.ewm(span=long_period, adjust=False).mean()
+    diff = exp1 - exp2
+    dea = diff.ewm(span=signal_period, adjust=False).mean()
+    return diff, dea
+
+print("正在为所有股票计算RSI指标...")
+df['rsi6'] = df.groupby('code')['close'].transform(lambda x: calculate_rsi(x, period=6))
+
+print("正在计算MACD... (步骤 1/2: 计算DIFF)")
+df['diff'] = df.groupby('code')['close'].transform(lambda x: calculate_macd(x, 6, 13, 5)[0])
+
+print("正在计算MACD... (步骤 2/2: 计算DEA)")
+df['dea'] = df.groupby('code')['diff'].transform(lambda x: x.ewm(span=5, adjust=False).mean())
+
+
+print("正在生成买入信号...")
+df['diff_prev'] = df.groupby('code')['diff'].shift(1)
+df['dea_prev'] = df.groupby('code')['dea'].shift(1)
+df['buy_signal'] = (df['diff'] > df['dea']) & (df['diff_prev'] < df['dea_prev']) & (df['diff'] > 0)
+df['abs_diff'] = abs(df['diff'])
+
+# 提取每周的最后一个交易日作为调仓日
+df.sort_values(by='date', inplace=True)
+df['year_week'] = df['date'].dt.to_period('W')
+trade_dates = df.groupby('year_week')['date'].max().sort_values().tolist()
+
+# ==========================================
+# 第三步：定义交易费率计算函数
+# ==========================================
+def calculate_fees(trade_type, price, volume):
+    amount = price * volume
+    commission = max(5.0, amount * 0.00025)
+    transfer_fee = amount * 0.00001
+    stamp_duty = amount * 0.0005 if trade_type == 'sell' else 0.0
+    total_fee = commission + transfer_fee + stamp_duty
+    return total_fee, amount
+
+# ==========================================
+# 第四步：账户类与回测主引擎
+# ==========================================
+class Account:
+    def __init__(self, initial_cash):
+        self.cash = initial_cash
+        self.positions = {}
+        self.trade_logs = []
+        self.history_assets = []
+
+    def get_total_asset(self, current_date, current_prices_dict):
+        stock_value = 0
+        for code, pos in self.positions.items():
+            price = current_prices_dict.get(code, pos['price'])
+            self.positions[code]['price'] = price
+            stock_value += pos['volume'] * price
+        return self.cash + stock_value
+
+account = Account(INITIAL_CASH)
+
+print("开始按周执行 MACD+RSI 策略模拟...")
+
+for date in trade_dates:
+    daily_data = df[df['date'] == date].set_index('code')
+    current_prices = daily_data['close'].to_dict()
+    status_dict = daily_data['tradestatus'].to_dict()
+    st_dict = daily_data['isST'].to_dict()
+    pct_chg_dict = daily_data['pctChg'].to_dict()
+
+    current_asset = account.get_total_asset(date, current_prices)
+    account.history_assets.append({'date': date, 'total_asset': current_asset})
+
+# ---------------- 卖出逻辑 ----------------
+    current_holdings = list(account.positions.keys())
+    for code in current_holdings:
+        if code not in daily_data.index:
+            lost_vol = account.positions[code]['volume']
+            last_price = account.positions[code]['price']
+            loss_amount = lost_vol * last_price
+            del account.positions[code]
+            account.trade_logs.append({
+                '日期': date, '股票代码': code, '买卖方向': '强制清理(退市)',
+                '成交价': 0, '成交股数': lost_vol, '成交金额': 0, '交易费': 0,
+                '可用现金': round(account.cash, 2),
+                '总资产': round(account.get_total_asset(date, current_prices), 2),
+                '备注': f'数据缺失/退市，市值计提全额亏损 {round(loss_amount, 2)}元'
+            })
+            continue
+
+        is_trading = status_dict.get(code, 0) == 1
+        pct_chg = pct_chg_dict.get(code, 0)
+        rsi = daily_data.loc[code, 'rsi6'] if 'rsi6' in daily_data.columns and code in daily_data.index else np.nan
+        diff = daily_data.loc[code, 'diff'] if 'diff' in daily_data.columns and code in daily_data.index else np.nan
+
+        # 卖出条件：RSI(6) > 75 或 MACD双线<0（水下）
+        should_sell = (rsi > 75) or (diff < 0)
+
+        if should_sell:
+            if is_trading and pct_chg > -9.3:
+                sell_price = current_prices[code]
+                sell_vol = account.positions[code]['volume']
+                fee, amount = calculate_fees('sell', sell_price, sell_vol)
+                account.cash += (amount - fee)
+                del account.positions[code]
+                account.trade_logs.append({
+                    '日期': date, '股票代码': code, '买卖方向': '卖出',
+                    '成交价': sell_price, '成交股数': sell_vol, '成交金额': round(amount, 2), '交易费': round(fee, 2),
+                    '可用现金': round(account.cash, 2),
+                    '总资产': round(account.get_total_asset(date, current_prices), 2),
+                    '备注': f'RSI={rsi:.2f}, DIFF={diff:.2f}'
+                })
+            elif not is_trading:
+                 account.trade_logs.append({
+                    '日期': date, '股票代码': code, '买卖方向': '卖出失败(停牌)',
+                     '备注': '触发卖出信号但停牌'
+                 })
+            elif pct_chg <= -9.3:
+                 account.trade_logs.append({
+                    '日期': date, '股票代码': code, '买卖方向': '卖出失败(跌停)',
+                     '备注': '触发卖出信号但跌停'
+                 })
+
+# ---------------- 选股逻辑 ----------------
+    valid_pool = daily_data[(daily_data['tradestatus'] == 1) &
+                            (daily_data['isST'] == 0) &
+                            (daily_data['peTTM'] > 0) & (daily_data['pbMRQ'] > 0) &
+                            (daily_data['buy_signal'])].copy()
+
+    # 按 abs(DIFF) 升序优先（近0轴优先）
+    target_codes = valid_pool.sort_values(by='abs_diff', ascending=True).head(TARGET_STOCK_NUM).index.tolist()
+
+# ---------------- 买入逻辑 ----------------
+    stocks_to_buy = [code for code in target_codes if code not in account.positions]
+    current_pos_count = len(account.positions)
+    free_slots = max(0, TARGET_STOCK_NUM - current_pos_count)
+    actual_stocks_to_buy = stocks_to_buy[:free_slots]
+
+    if len(actual_stocks_to_buy) > 0:
+        # 资金只均分给实际能买的几只股票
+        cash_per_stock = account.cash / len(actual_stocks_to_buy) if account.cash > 0 and len(actual_stocks_to_buy) > 0 else 0
+
+        for code in actual_stocks_to_buy:
+            is_trading = status_dict.get(code, 0) == 1
+            pct_chg = pct_chg_dict.get(code, 0)
+            is_st = st_dict.get(code, 0) == 1
+
+            if is_trading and not is_st and pct_chg < 9.3:
+                buy_price = current_prices[code]
+                affordable_shares = int((cash_per_stock * 0.997) / buy_price)
+                buy_vol = (affordable_shares // 100) * 100
+
+                if buy_vol >= 100:
+                    fee, amount = calculate_fees('buy', buy_price, buy_vol)
+                    if account.cash >= (amount + fee):
+                        account.cash -= (amount + fee)
+                        account.positions[code] = {'volume': buy_vol, 'price': buy_price}
+                        account.trade_logs.append({
+                            '日期': date, '股票代码': code, '买卖方向': '买入',
+                            '成交价': buy_price, '成交股数': buy_vol,
+                            '成交金额': round(amount, 2), '交易费': round(fee, 2),
+                            '可用现金': round(account.cash, 2),
+                            '总资产': round(account.get_total_asset(date, current_prices), 2),
+                            '备注': 'MACD近零轴金叉买入'
+                        })
+            elif pct_chg >= 9.3:
+                 account.trade_logs.append({
+                    '日期': date, '股票代码': code, '买卖方向': '买入失败(涨停)',
+                     '备注': '入选但涨停无法买入'
+                 })
+
+# ==========================================
+# 第五步：输出结果与可视化
+# ==========================================
+df_trades = pd.DataFrame(account.trade_logs)
+if not df_trades.empty:
+    df_trades.to_excel(OUTPUT_EXCEL, index=False)
+    print(f"✅ 交易明细已成功导出至: {OUTPUT_EXCEL}")
+else:
+    print("- 策略执行完毕，但没有产生任何交易。")
+
+df_assets = pd.DataFrame(account.history_assets)
+if not df_assets.empty:
+    df_assets.set_index('date', inplace=True)
+    final_asset = df_assets['total_asset'].iloc[-1]
+    total_return = (final_asset - INITIAL_CASH) / INITIAL_CASH * 100
+
+    print(f"💰 初始本金: {INITIAL_CASH:,.2f} 元")
+    print(f"💰 最终总资产: {final_asset:,.2f} 元")
+    print(f"📈 策略总收益率: {total_return:.2f}%")
+
+    # 绘制收益曲线
+    plt.figure(figsize=(12, 6))
+    plt.plot(df_assets.index, df_assets['total_asset'], color='#ff7f0e', linewidth=2, label='策略总资产')
+    plt.title(f'MACD近零轴金叉+RSI卖出策略曲线 | 总收益率: {total_return:.2f}%', fontsize=14)
+    plt.xlabel('时间', fontsize=12)
+    plt.ylabel('总资产 (元)', fontsize=12)
+    plt.axhline(y=INITIAL_CASH, color='gray', linestyle='--', label='初始本金')
+    plt.grid(True, linestyle='--', alpha=0.6)
+    plt.legend(loc='upper left', fontsize=12)
+    plt.tight_layout()
+    plt.show()
+else:
+    print("- 没有资产历史可以绘制。")
