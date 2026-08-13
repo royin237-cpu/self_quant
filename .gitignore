@@ -1,6 +1,8 @@
 # 数据文件（大量 CSV/parquet，不适合放入 git）
+# 仅保留 data/samples/ 下的样本数据（每类各5个）
 data/data/
 data/data_test/
+!data/samples/
 
 # Python 缓存
 __pycache__/
